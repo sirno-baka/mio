@@ -7,6 +7,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawF
 // can use `std::os::fd` and be merged with the above.
 #[cfg(target_os = "hermit")]
 use std::os::hermit::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "popugos")]
+use std::os::popugos::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{
     AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
@@ -90,7 +92,7 @@ impl TcpStream {
     #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = new_for_addr(addr)?;
-        #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+        #[cfg(any(unix, target_os = "hermit", target_os = "popugos", target_os = "wasi"))]
         let stream = unsafe { TcpStream::from_raw_fd(socket) };
         #[cfg(windows)]
         let stream = unsafe { TcpStream::from_raw_socket(socket as _) };
@@ -354,21 +356,21 @@ impl fmt::Debug for TcpStream {
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "popugos", target_os = "wasi"))]
 impl IntoRawFd for TcpStream {
     fn into_raw_fd(self) -> RawFd {
         self.inner.into_inner().into_raw_fd()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "popugos", target_os = "wasi"))]
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "popugos", target_os = "wasi"))]
 impl FromRawFd for TcpStream {
     /// Converts a `RawFd` to a `TcpStream`.
     ///
@@ -468,7 +470,7 @@ impl From<TcpStream> for net::TcpStream {
         // mio::net::TcpStream which ensures that we actually pass in a valid file
         // descriptor/socket
         unsafe {
-            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+            #[cfg(any(unix, target_os = "hermit", target_os = "popugos", target_os = "wasi"))]
             {
                 net::TcpStream::from_raw_fd(stream.into_raw_fd())
             }

@@ -5,6 +5,8 @@ use std::os::fd::AsRawFd;
 // can use `std::os::fd` and be merged with the above.
 #[cfg(target_os = "hermit")]
 use std::os::hermit::io::AsRawFd;
+#[cfg(target_os = "popugos")]
+use std::os::popugos::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 #[cfg(debug_assertions)]
@@ -107,6 +109,7 @@ impl<T> DerefMut for IoSource<T> {
 #[cfg(any(
     unix,
     target_os = "hermit",
+    target_os = "popugos",
     all(target_os = "wasi", not(target_env = "p1"))
 ))]
 impl<T> event::Source for IoSource<T>

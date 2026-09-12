@@ -14,6 +14,7 @@
 //! * `Waker`: see [`crate::Waker`].
 
 cfg_os_poll! {
+    #[allow(unused_macros)]
     macro_rules! debug_detail {
         (
             $type: ident ($event_type: ty), $test: path,
@@ -65,6 +66,12 @@ cfg_os_poll! {
 cfg_os_poll! {
     mod windows;
     pub use self::windows::*;
+}
+
+#[cfg(target_os = "popugos")]
+cfg_os_poll! {
+    mod popugos;
+    pub use self::popugos::*;
 }
 
 #[cfg(all(target_os = "wasi", target_env = "p1"))]
