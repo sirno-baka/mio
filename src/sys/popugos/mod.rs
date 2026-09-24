@@ -149,31 +149,42 @@ impl Selector {
             events.push(Event { token, events: POLLIN });
         }
 
-        let mut delivered = Vec::new();
-        for (registration, poll_fd) in active_registrations.iter().zip(poll_fds[1..].iter()) {
-            if poll_fd.revents != 0 {
-                events.push(Event { token: registration.token, events: poll_fd.revents });
-                delivered.push((registration.fd, registration.generation, poll_fd.revents));
+        // A Token is a raw pointer to Tokio's ScheduledIo. Registrations can
+        // be removed/reused from another thread while this poll() is blocked,
+        // so never forward an event from the stale snapshot until the current
+        // (fd, generation) pair has been revalidated under the registry lock.
+        // Otherwise a closed HLS connection can deliver a dangling Token and
+        // wake (or even dereference) an unrelated/freed ScheduledIo.
+        let mut current = self.state.registrations.lock().unwrap();
+        for (snapshot, poll_fd) in active_registrations.iter().zip(poll_fds[1..].iter()) {
+            if poll_fd.revents == 0 {
+                continue;
             }
-        }
 
-        if !delivered.is_empty() {
-            let mut current = self.state.registrations.lock().unwrap();
-            for (fd, generation, revents) in delivered {
-                let Some(registration) = current
-                    .iter_mut()
-                    .find(|registration| registration.fd == fd && registration.generation == generation)
-                else {
-                    continue;
-                };
+            let Some(registration) = current
+                .iter_mut()
+                .find(|registration| {
+                    registration.fd == snapshot.fd
+                        && registration.generation == snapshot.generation
+                })
+            else {
+                // The fd was deregistered or reregistered while poll() slept.
+                // kick() guarantees the next poll uses the new registration.
+                continue;
+            };
 
-                if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
-                    // Error/closure is itself an edge. Deliver it once; the
-                    // consumer will observe the error/EOF and deregister.
-                    registration.armed = 0;
-                } else {
-                    registration.armed &= !(revents & (POLLIN | POLLPRI | POLLOUT));
-                }
+            // Use the currently validated token, never the snapshot token.
+            events.push(Event {
+                token: registration.token,
+                events: poll_fd.revents,
+            });
+
+            if poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                // Error/closure is itself an edge. Deliver it once; the
+                // consumer will observe the error/EOF and deregister.
+                registration.armed = 0;
+            } else {
+                registration.armed &= !(poll_fd.revents & (POLLIN | POLLPRI | POLLOUT));
             }
         }
         Ok(())
