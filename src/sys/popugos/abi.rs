@@ -4,6 +4,9 @@ use std::io;
 use std::time::Duration;
 
 const SYS_POLL: u32 = 168;
+const SYS_READ: u32 = 3;
+const SYS_WRITE: u32 = 4;
+const SYS_PIPE: u32 = 42;
 const SYS_CLOSE: u32 = 6;
 const SYS_FCNTL: u32 = 55;
 const SYS_SOCKET: u32 = 359;
@@ -41,6 +44,36 @@ pub(crate) fn poll(fds: &mut [PollFd], timeout: Option<Duration>) -> io::Result<
     } else {
         Ok(result as usize)
     }
+}
+
+pub(crate) fn pipe() -> io::Result<[i32; 2]> {
+    let mut fds = [0u32; 2];
+    cvt(unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as usize as u32) })?;
+    Ok([fds[0] as i32, fds[1] as i32])
+}
+
+pub(crate) fn read(fd: i32, buffer: &mut [u8]) -> io::Result<usize> {
+    cvt(unsafe {
+        syscall3(
+            SYS_READ,
+            fd as u32,
+            buffer.as_mut_ptr() as usize as u32,
+            buffer.len() as u32,
+        )
+    })
+    .map(|result| result as usize)
+}
+
+pub(crate) fn write(fd: i32, buffer: &[u8]) -> io::Result<usize> {
+    cvt(unsafe {
+        syscall3(
+            SYS_WRITE,
+            fd as u32,
+            buffer.as_ptr() as usize as u32,
+            buffer.len() as u32,
+        )
+    })
+    .map(|result| result as usize)
 }
 
 pub(crate) fn socket(domain: u32, ty: u32, protocol: u32) -> io::Result<i32> {

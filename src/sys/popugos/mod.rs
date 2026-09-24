@@ -66,6 +66,8 @@ struct Registration {
 struct SelectorState {
     registrations: Mutex<Vec<Registration>>,
     pending_wake: Mutex<Option<Token>>,
+    wake_reader: RawFd,
+    wake_writer: RawFd,
     #[cfg(debug_assertions)]
     id: usize,
 }
@@ -80,10 +82,23 @@ pub struct Selector {
 
 impl Selector {
     pub fn new() -> io::Result<Self> {
+        let [wake_reader, wake_writer] = abi::pipe()?;
+        if let Err(error) = abi::set_nonblocking(wake_reader) {
+            abi::close(wake_reader);
+            abi::close(wake_writer);
+            return Err(error);
+        }
+        if let Err(error) = abi::set_nonblocking(wake_writer) {
+            abi::close(wake_reader);
+            abi::close(wake_writer);
+            return Err(error);
+        }
         Ok(Self {
             state: Arc::new(SelectorState {
                 registrations: Mutex::new(Vec::new()),
                 pending_wake: Mutex::new(None),
+                wake_reader,
+                wake_writer,
                 #[cfg(debug_assertions)]
                 id: NEXT_SELECTOR_ID.fetch_add(1, Ordering::Relaxed),
             }),
@@ -97,36 +112,32 @@ impl Selector {
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
         let registrations = self.state.registrations.lock().unwrap().clone();
-        let mut poll_fds: Vec<abi::PollFd> = registrations
-            .iter()
-            .map(|registration| abi::PollFd {
-                fd: registration.fd,
-                events: interests_to_poll(registration.interests),
-                revents: 0,
-            })
-            .collect();
+        let mut poll_fds = Vec::with_capacity(registrations.len() + 1);
+        poll_fds.push(abi::PollFd {
+            fd: self.state.wake_reader,
+            events: POLLIN,
+            revents: 0,
+        });
+        poll_fds.extend(registrations.iter().map(|registration| abi::PollFd {
+            fd: registration.fd,
+            events: interests_to_poll(registration.interests),
+            revents: 0,
+        }));
 
         let woke = self.state.pending_wake.lock().unwrap().is_some();
         let timeout = if woke { Some(Duration::ZERO) } else { timeout };
+        abi::poll(&mut poll_fds, timeout)?;
 
-        if poll_fds.is_empty() {
-            match timeout {
-                Some(timeout) if !timeout.is_zero() => std::thread::sleep(timeout),
-                Some(_) => {}
-                None => loop {
-                    // A single-threaded target cannot be woken while it is blocked.
-                    std::thread::sleep(Duration::from_secs(24 * 60 * 60));
-                }
-            }
-        } else {
-            abi::poll(&mut poll_fds, timeout)?;
+        if poll_fds[0].revents & POLLIN != 0 {
+            let mut buffer = [0u8; 64];
+            while matches!(abi::read(self.state.wake_reader, &mut buffer), Ok(n) if n != 0) {}
         }
 
         if let Some(token) = self.state.pending_wake.lock().unwrap().take() {
             events.push(Event { token, events: POLLIN });
         }
 
-        for (registration, poll_fd) in registrations.iter().zip(poll_fds.iter()) {
+        for (registration, poll_fd) in registrations.iter().zip(poll_fds[1..].iter()) {
             if poll_fd.revents != 0 {
                 events.push(Event { token: registration.token, events: poll_fd.revents });
             }
@@ -165,12 +176,22 @@ impl Selector {
     }
 
     fn wake(&self, token: Token) -> io::Result<()> {
-        self.state.pending_wake.lock().unwrap().replace(token);
+        let mut pending_wake = self.state.pending_wake.lock().unwrap();
+        if pending_wake.replace(token).is_none() {
+            abi::write(self.state.wake_writer, &[1])?;
+        }
         Ok(())
     }
 
     #[cfg(debug_assertions)]
     pub fn id(&self) -> usize { self.state.id }
+}
+
+impl Drop for SelectorState {
+    fn drop(&mut self) {
+        abi::close(self.wake_reader);
+        abi::close(self.wake_writer);
+    }
 }
 
 fn interests_to_poll(interests: Interest) -> i16 {
