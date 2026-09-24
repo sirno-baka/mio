@@ -60,6 +60,12 @@ struct Registration {
     fd: RawFd,
     token: Token,
     interests: Interest,
+    // PopugOS exposes level-triggered poll(2), while Mio's socket users are
+    // written for edge/one-shot style readiness. Keep only readiness classes
+    // that are currently armed; a delivered class stays disarmed until an I/O
+    // attempt returns WouldBlock and IoSourceState rearms the registration.
+    armed: i16,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -112,15 +118,20 @@ impl Selector {
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
         let registrations = self.state.registrations.lock().unwrap().clone();
-        let mut poll_fds = Vec::with_capacity(registrations.len() + 1);
+        let active_registrations: Vec<_> = registrations
+            .iter()
+            .filter(|registration| registration.armed != 0)
+            .cloned()
+            .collect();
+        let mut poll_fds = Vec::with_capacity(active_registrations.len() + 1);
         poll_fds.push(abi::PollFd {
             fd: self.state.wake_reader,
             events: POLLIN,
             revents: 0,
         });
-        poll_fds.extend(registrations.iter().map(|registration| abi::PollFd {
+        poll_fds.extend(active_registrations.iter().map(|registration| abi::PollFd {
             fd: registration.fd,
-            events: interests_to_poll(registration.interests),
+            events: registration.armed,
             revents: 0,
         }));
 
@@ -137,42 +148,86 @@ impl Selector {
             events.push(Event { token, events: POLLIN });
         }
 
-        for (registration, poll_fd) in registrations.iter().zip(poll_fds[1..].iter()) {
+        let mut delivered = Vec::new();
+        for (registration, poll_fd) in active_registrations.iter().zip(poll_fds[1..].iter()) {
             if poll_fd.revents != 0 {
                 events.push(Event { token: registration.token, events: poll_fd.revents });
+                delivered.push((registration.fd, registration.generation, poll_fd.revents));
+            }
+        }
+
+        if !delivered.is_empty() {
+            let mut current = self.state.registrations.lock().unwrap();
+            for (fd, generation, revents) in delivered {
+                let Some(registration) = current
+                    .iter_mut()
+                    .find(|registration| registration.fd == fd && registration.generation == generation)
+                else {
+                    continue;
+                };
+
+                if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                    // Error/closure is itself an edge. Deliver it once; the
+                    // consumer will observe the error/EOF and deregister.
+                    registration.armed = 0;
+                } else {
+                    registration.armed &= !(revents & (POLLIN | POLLPRI | POLLOUT));
+                }
             }
         }
         Ok(())
     }
 
     pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
-        let mut registrations = self.state.registrations.lock().unwrap();
-        if registrations.iter().any(|registration| registration.fd == fd) {
-            return Err(io::ErrorKind::AlreadyExists.into());
+        {
+            let mut registrations = self.state.registrations.lock().unwrap();
+            if registrations.iter().any(|registration| registration.fd == fd) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            registrations.push(Registration {
+                fd,
+                token,
+                interests,
+                armed: interests_to_poll(interests),
+                generation: 1,
+            });
         }
-        registrations.push(Registration { fd, token, interests });
-        Ok(())
+        self.kick()
     }
 
     pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
-        let mut registrations = self.state.registrations.lock().unwrap();
-        let registration = registrations
-            .iter_mut()
-            .find(|registration| registration.fd == fd)
-            .ok_or(io::ErrorKind::NotFound)?;
-        registration.token = token;
-        registration.interests = interests;
-        Ok(())
+        {
+            let mut registrations = self.state.registrations.lock().unwrap();
+            let registration = registrations
+                .iter_mut()
+                .find(|registration| registration.fd == fd)
+                .ok_or(io::ErrorKind::NotFound)?;
+            registration.token = token;
+            registration.interests = interests;
+            registration.armed = interests_to_poll(interests);
+            registration.generation = registration.generation.wrapping_add(1);
+        }
+        self.kick()
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        let mut registrations = self.state.registrations.lock().unwrap();
-        let index = registrations
-            .iter()
-            .position(|registration| registration.fd == fd)
-            .ok_or(io::ErrorKind::NotFound)?;
-        registrations.swap_remove(index);
-        Ok(())
+        {
+            let mut registrations = self.state.registrations.lock().unwrap();
+            let index = registrations
+                .iter()
+                .position(|registration| registration.fd == fd)
+                .ok_or(io::ErrorKind::NotFound)?;
+            registrations.swap_remove(index);
+        }
+        self.kick()
+    }
+
+    fn kick(&self) -> io::Result<()> {
+        match abi::write(self.state.wake_writer, &[1]) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn wake(&self, token: Token) -> io::Result<()> {
@@ -209,6 +264,8 @@ pub(crate) struct IoSourceState {
 struct IoSourceRegistration {
     selector: Selector,
     fd: RawFd,
+    token: Token,
+    interests: Interest,
     registered: bool,
 }
 
@@ -219,7 +276,22 @@ impl IoSourceState {
     where
         F: FnOnce(&T) -> io::Result<R>,
     {
-        f(io)
+        let result = f(io);
+
+        // poll(2) is level-triggered. The selector disarms readiness after it
+        // has delivered an event so a permanently writable socket cannot keep
+        // Tokio in a hot reactor loop. Once an actual I/O operation drains the
+        // readiness and reaches WouldBlock, rearm the original interests just
+        // like Mio's registered_io_source backend does.
+        if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+            if let Some(state) = self.inner.as_ref() {
+                state
+                    .selector
+                    .reregister(state.fd, state.token, state.interests)?;
+            }
+        }
+
+        result
     }
 
     pub(crate) fn register(
@@ -237,6 +309,8 @@ impl IoSourceState {
         self.inner = Some(IoSourceRegistration {
             selector,
             fd,
+            token,
+            interests,
             registered: true,
         });
         Ok(())
@@ -249,7 +323,12 @@ impl IoSourceState {
         interests: Interest,
         fd: RawFd,
     ) -> io::Result<()> {
-        registry.selector().reregister(fd, token, interests)
+        registry.selector().reregister(fd, token, interests).map(|()| {
+            if let Some(state) = self.inner.as_mut() {
+                state.token = token;
+                state.interests = interests;
+            }
+        })
     }
 
     pub(crate) fn deregister(&mut self, registry: &Registry, fd: RawFd) -> io::Result<()> {
