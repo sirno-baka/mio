@@ -1,6 +1,5 @@
 use std::io;
 use std::os::popugos::io::RawFd;
-#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,7 +64,7 @@ struct Registration {
     // that are currently armed; a delivered class stays disarmed until an I/O
     // attempt returns WouldBlock and IoSourceState rearms the registration.
     armed: i16,
-    generation: u64,
+    generation: usize,
 }
 
 #[derive(Debug)]
@@ -74,6 +73,7 @@ struct SelectorState {
     pending_wake: Mutex<Option<Token>>,
     wake_reader: RawFd,
     wake_writer: RawFd,
+    next_generation: AtomicUsize,
     #[cfg(debug_assertions)]
     id: usize,
 }
@@ -105,6 +105,7 @@ impl Selector {
                 pending_wake: Mutex::new(None),
                 wake_reader,
                 wake_writer,
+                next_generation: AtomicUsize::new(1),
                 #[cfg(debug_assertions)]
                 id: NEXT_SELECTOR_ID.fetch_add(1, Ordering::Relaxed),
             }),
@@ -189,7 +190,7 @@ impl Selector {
                 token,
                 interests,
                 armed: interests_to_poll(interests),
-                generation: 1,
+                generation: self.state.next_generation.fetch_add(1, Ordering::Relaxed),
             });
         }
         self.kick()
@@ -205,7 +206,7 @@ impl Selector {
             registration.token = token;
             registration.interests = interests;
             registration.armed = interests_to_poll(interests);
-            registration.generation = registration.generation.wrapping_add(1);
+            registration.generation = self.state.next_generation.fetch_add(1, Ordering::Relaxed);
         }
         self.kick()
     }
