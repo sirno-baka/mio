@@ -28,6 +28,33 @@ pub struct Event {
 
 pub type Events = Vec<Event>;
 
+#[derive(Debug)]
+pub struct SourceFd<'a>(pub &'a RawFd);
+
+impl crate::event::Source for SourceFd<'_> {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        registry.selector().register(*self.0, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        registry.selector().reregister(*self.0, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        registry.selector().deregister(*self.0)
+    }
+}
+
 pub mod event {
     use std::fmt;
 

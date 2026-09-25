@@ -88,6 +88,14 @@ pub mod unix {
     pub use crate::sys::SourceFd;
 }
 
+#[cfg(all(target_os = "popugos", feature = "os-ext"))]
+#[cfg_attr(docsrs, doc(cfg(all(target_os = "popugos", feature = "os-ext"))))]
+pub mod popugos {
+    //! PopugOS-specific polling extensions.
+
+    pub use crate::sys::SourceFd;
+}
+
 #[cfg(all(target_os = "hermit", feature = "os-ext"))]
 #[cfg_attr(docsrs, doc(cfg(all(target_os = "hermit", feature = "os-ext"))))]
 pub mod hermit {
