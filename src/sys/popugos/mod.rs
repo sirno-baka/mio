@@ -28,8 +28,15 @@ pub struct Event {
 
 pub type Events = Vec<Event>;
 
+/// Adapter for registering an arbitrary raw file descriptor with Mio's PopugOS poller.
+///
+/// The referenced descriptor must remain valid for as long as this value is used
+/// for registration, reregistration, or deregistration.
 #[derive(Debug)]
-pub struct SourceFd<'a>(pub &'a RawFd);
+pub struct SourceFd<'a>(
+    /// Raw file descriptor exposed to Mio's polling backend.
+    pub &'a RawFd,
+);
 
 impl crate::event::Source for SourceFd<'_> {
     fn register(
