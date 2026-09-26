@@ -324,12 +324,18 @@ impl IoSourceState {
     {
         let result = f(io);
 
-        // poll(2) is level-triggered. The selector disarms readiness after it
-        // has delivered an event so a permanently writable socket cannot keep
-        // Tokio in a hot reactor loop. Once an actual I/O operation drains the
-        // readiness and reaches WouldBlock, rearm the original interests just
-        // like Mio's registered_io_source backend does.
-        if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+        // PopugOS poll(2) is level-triggered, while this selector presents
+        // one-shot readiness to Tokio. Rearm after *each actual I/O attempt
+        // that made progress*, not only after WouldBlock. Tokio/Hyper is allowed
+        // to consume just part of a readable socket and then yield for body
+        // backpressure; waiting for a later WouldBlock can otherwise leave the
+        // fd permanently disarmed with unread bytes in the kernel socket.
+        //
+        // Rearming on success causes at most one extra level-triggered event
+        // until the next I/O attempt because select() disarms it again.
+        if result.is_ok()
+            || matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        {
             if let Some(state) = self.inner.as_ref() {
                 state
                     .selector
